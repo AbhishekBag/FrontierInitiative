@@ -1,11 +1,30 @@
 # Frontier Feature — User Control & Consent State Management
 ## Engineering Comparative Analysis — v2.0
 
-> **Status:** Draft v2.0 — Created: 2026-05-11
+> **Status:** Draft v2.0 — Updated: 2026-05-11 (incorporates SSC Sync Internal meeting transcript + notes, May 8 2026)
 > **Supersedes:** `Frontier_Consent_Storage_Comparison.md` v0.1 (2026-05-08)
 > **Author:** Abhishek Bag (abbag)
 > **Reviewers:** Sridhar Dantuluri, T Madhu Kumar, Shreeya Singh, Chaitanya Gogineni, Gabrielle Stadlen
 > **Action items from:** SSC Sync Internal — May 8 2026; Sridhar Dantuluri review comments — May 11 2026
+
+---
+
+## 🔑 Key Insights from May 8, 2026 SSC Sync Internal Meeting
+
+> The following critical clarifications emerged from the recorded team discussion (Abhishek Bag, T Madhu Kumar, Shreeya Singh, Abhishek Malviya). These update the v0.1 framing significantly.
+
+| # | Insight | Impact on Document |
+|---|---------|-------------------|
+| **1** | **ECS ≠ User Preferences Store.** Shreeya clarified: ECS is for *feature ring/ring-based rollout* (provisioning Microsoft-controlled feature gates), NOT for storing user opt-in preferences. Storing Frontier enrollment state in ECS is a conceptual misuse. | Updates §4 Option A framing |
+| **2** | **Cosmos DB is the actual Source of Truth.** Real architecture: Client → Persistence API → **Cosmos DB** (SoT) → pipeline → ECS (derived read cache). ECS is NOT the source of truth. | Updates §4 architecture diagrams |
+| **3** | **UCS has NO client-side cache.** Server-side caching only. Boot-time requires a network call. SLA ~50ms typical, ~100ms worst case — Madhu confirmed this is acceptable. | Updates §4 Option C, §6 boot table |
+| **4** | **Roaming writes local cache first, then syncs to cloud.** Correct write flow: write to local cache immediately → background async sync to Roaming Service. Writes feel instantaneous on-device. | Updates §4 Option B sequence diagram |
+| **5** | **Privacy concern (Sridhar) on ECS token/local cache.** Sridhar raised privacy concerns about token handling and local device caching with the ECS approach. Team to clarify with Sridhar this weekend. | New open question added |
+| **6** | **Android Roaming = JNI bridge (Java → C++).** No SDK/contract yet. Building JNI (Java Native Interface) needed to call Roaming C++ code from Android Java. Estimated effort: **2–4 weeks**. | Updates §3 Android row |
+| **7** | **Decision direction is clear:** Roaming Client for enrollment (User Control). UCS only if future consent requirements demand it. | Updates §7 recommendation |
+| **8** | **Separate comparison matrices needed.** v0.1 matrix only covered consent storage. Need separate matrices for (a) enrollment/control and (b) future consent. | New §8A and §8B matrices added |
+| **9** | **~30-day cache cool-off period under discussion.** Sridhar and PMs discussing ~30-day cache expiration for enrollment state in C-light sims. | New note in §3 |
+| **10** | **Commercial admin controls absent from both UCS and Roaming.** Neither system currently exposes tenant admin policy controls — confirmed open gap. | Adds clarity to §5 |
 
 ---
 
@@ -180,7 +199,7 @@ graph LR
 |----------|---------------|-----------|-----------------|-----------------|
 | **WAC** | ✅ (`IRoamingSettingCache`) | ✅ (production) | — | Roaming Client |
 | **Win32** | ⚠️ POC (Shreeya + Abhishek M) | ✅ Config client | ✅ Registry/Prefs | Roaming Client (post-POC) |
-| **Android** | ⚠️ POC (Madhu) | ❌ | ✅ SharedPreferences | Roaming Client (post-POC) |
+| **Android** | ⚠️ POC (Madhu) — **JNI bridge required** (Java → C++), ~2–4 weeks | ❌ | ✅ SharedPreferences | Roaming Client (post-JNI, post-POC) |
 | **iOS** | ❌ Not started | ❌ | ✅ Keychain | Roaming Client (post-POC) |
 
 ---
@@ -193,30 +212,39 @@ Cloud sync ensures that when a user changes their Frontier setting on one device
 
 ### 4.1 Option A — ECS + Frontier Persistence Service
 
+> ⚠️ **Conceptual note (from meeting):** ECS is designed for Microsoft-controlled **feature ring rollout** (e.g., gradually enabling a feature for 1% → 10% → 100% of users in rings). It is **not designed** to store user opt-in preferences. While the current WAC implementation routes Frontier enrollment through ECS, this is architecturally a misuse of ECS. The real source of truth is **Cosmos DB** (via the Frontier Persistence Service API) — ECS merely serves as a derived read cache.
+
 ```mermaid
 sequenceDiagram
     participant C as Client (WAC)
-    participant FPS as Frontier Persistence Service
-    participant ECS as ECS (FrontierAudience segment)
+    participant FPS as Frontier Persistence Service API
+    participant DB as Cosmos DB (Source of Truth)
+    participant ECS as ECS (FrontierAudience — derived cache)
     participant C2 as Another Client / Platform
 
     C->>FPS: Write: userId + FrontierEnabled=true
+    FPS->>DB: Persist to Cosmos DB
+    DB-->>FPS: Stored
     FPS-->>C: ACK
-    FPS->>ECS: Update FrontierAudience segment (async)
-    Note over ECS: Propagation delay: seconds to minutes
+    FPS->>ECS: Update FrontierAudience segment (async pipeline)
+    Note over ECS: Propagation delay: seconds to minutes (derived — not SoT)
 
     C2->>ECS: Read at boot: FrontierAudience?
     ECS-->>C2: Enrolled = true/false
+    Note over C2,ECS: ECS may be stale if pipeline lagged
 ```
 
 **Characteristics:**
 | Attribute | Value |
 |-----------|-------|
-| Write path | Client → FPS → ECS (two hops, async) |
-| Read path | ECS segment pull at boot |
-| Propagation latency | Seconds–minutes (ECS async) |
-| Cross-platform | WAC only; other platforms require Elie's team |
-| Downstream integration | Manual — requires custom pipelines |
+| Actual source of truth | **Cosmos DB** (via Frontier Persistence Service) |
+| Write path | Client → FPS API → Cosmos DB → async pipeline → ECS (two hops, async) |
+| Read path | ECS segment pull at boot (derived cache, not SoT) |
+| Conceptual fit | ⚠️ ECS is for feature gating, not user preferences — conceptual mismatch |
+| Propagation latency | Seconds–minutes (ECS async pipeline) |
+| Cross-platform | WAC only; other platforms require Elie's team + backend scaling |
+| Privacy concerns | ⚠️ Sridhar raised token handling / local cache privacy concerns (TBD) |
+| ECS expansion | Backend scaling needed for non-WAC platforms (not just client changes) |
 | SISU ownership | ❌ External (Elie Aoun's team) |
 
 ### 4.2 Option B — Roaming Client (SISU/SSC Team)
@@ -224,28 +252,33 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as Client (Any Platform)
-    participant SDK as Roaming Client SDK
+    participant SDK as Roaming Client SDK (local cache)
     participant RS as Roaming Service (SISU infra)
     participant C2 as Another Device / Platform
 
     C->>SDK: Write: FrontierEnabled=true
-    SDK->>RS: Delta sync to cloud
+    SDK-->>C: ACK immediately (local cache written first)
+    SDK->>RS: Background async sync to cloud (delta)
     RS-->>C2: Push/pull on next sync interval
 
     C->>SDK: Read: FrontierEnabled?
-    SDK-->>C: Served from local cache (fast)
-    SDK->>RS: Async validate/refresh (non-blocking)
+    SDK-->>C: Served from local cache (fast, < 5ms)
+    SDK->>RS: Async validate/refresh (non-blocking, background)
+    Note over SDK,RS: Periodic refresh keeps cache in sync
 ```
 
 **Characteristics:**
 | Attribute | Value |
 |-----------|-------|
-| Write path | Client → Roaming SDK → Roaming Service (one hop) |
-| Read path | Local Roaming cache (fast); async refresh from service |
-| Propagation latency | Near-real-time (delta sync) |
-| Cross-platform | Designed for it; POCs on Win32, Android, Web |
+| Write path | Client → Roaming SDK (local cache first, then background sync to service) |
+| Read path | Local Roaming cache (fast, < 5ms); async background refresh from service |
+| Write latency | Instantaneous from client perspective (local cache write + background cloud sync) |
+| Propagation latency | Near-real-time (delta sync to other devices after background upload) |
+| Cross-platform | Designed for it; Win32+Android POCs; iOS not started |
+| Cache expiration | ~30-day cool-off period under discussion (Sridhar + PMs, C-light sims) |
 | Downstream integration | ⚠️ Open question: can Roaming push to external services? |
-| SISU ownership | ✅ SISU team fully owns |
+| Android integration | JNI (Java Native Interface) needed to call C++ Roaming code — 2–4 weeks effort |
+| SISU ownership | ✅ Fully owned by SISU/SSC team |
 
 ### 4.3 Option C — UCS (Unified Consent Service)
 
@@ -269,9 +302,11 @@ sequenceDiagram
 | Attribute | Value |
 |-----------|-------|
 | Write path | Client → UCS API (single hop, synchronous) |
-| Read path | UCS API call (or client SDK cache) |
-| Propagation latency | Near-real-time (API-based) |
+| Read path | UCS API call — **no client-side cache** (server-side caching only) |
+| Boot-time requirement | ⚠️ Network call required at every boot — no local cache |
+| API response SLA | ~50ms typical, ~100ms worst case (Madhu confirmed acceptable) |
 | Cross-platform | Any platform via API/SDK |
+| Tenant admin controls | ❌ Not currently supported — open gap |
 | Downstream integration | ✅ Native webhooks/events to Pacman, telemetry |
 | SISU ownership | ❌ External (UCS team) |
 
@@ -279,16 +314,22 @@ sequenceDiagram
 
 | Criterion | ECS + FPS | Roaming Client | UCS |
 |-----------|-----------|----------------|-----|
-| **Write latency** | Low (FPS ACK fast; ECS async) | Low (SDK local ACK) | Low (direct API) |
-| **Cross-device propagation** | Seconds–minutes | Near-real-time | Near-real-time |
-| **Read latency** | Fast (ECS boot segment) | Fast (local cache) | Medium (API; SDK cache TBD) |
-| **Offline support** | Partial (stale ECS cache) | ✅ Local cache (write queued) | ❌ Network required for write |
+| **Actual source of truth** | Cosmos DB (FPS) | Roaming Service | UCS service |
+| **ECS role** | Derived read cache (NOT SoT) | N/A | N/A |
+| **Write latency** | Low (FPS ACK fast; Cosmos async) | **Instantaneous** (local cache first, then background sync) | Low (direct API ~50ms) |
+| **Cross-device propagation** | Seconds–minutes (ECS pipeline async) | Near-real-time (background delta sync) | Near-real-time |
+| **Read latency** | Fast (ECS cached segment) | **Fastest** (local cache, < 5ms) | Medium (~50ms network call) |
+| **Local client cache** | ✅ ECS local cache | ✅ Roaming local cache | ❌ No client cache — network call always |
+| **Boot-time (cold start)** | ECS fetch from network | Roaming Service fetch → cache write | Network call to UCS (~50ms SLA) |
+| **Boot-time (warm start)** | ECS local cache (fast) | Roaming local cache (fastest) | Network call to UCS (~50ms SLA) |
+| **Offline support** | Partial (stale ECS cache) | ✅ Local cache survives offline (write queued) | ❌ Network required for reads |
+| **Cache expiration** | ECS TTL | ~30-day cool-off (under discussion) | Server-side only |
 | **Cross-platform today** | WAC only | WAC + POCs (Win32, Android) | Any (API-based) |
 | **Downstream integration** | ❌ Custom pipelines needed | ⚠️ Investigate push capability | ✅ Native events |
-| **SISU team ownership** | ❌ External dependency | ✅ Fully owned | ❌ External dependency |
-| **Tenant admin override** | ⚠️ Partial (ECS segment) | ⚠️ Per-user only natively | ✅ Policy support built-in |
-| **Audit / compliance** | ⚠️ Moderate | ❌ Not purpose-built | ✅ Full audit trail |
-| **User Consent readiness** | ❌ Not designed for consent | ⚠️ Can store signal, not legal record | ✅ Purpose-built |
+| **Conceptual fit for user prefs** | ❌ ECS is for feature gating, not user settings | ✅ Purpose-built for settings/prefs | ✅ Purpose-built for consent/control |
+| **Tenant admin controls** | ⚠️ Partial (via ECS) | ❌ Not currently exposed | ❌ Not currently exposed |
+| **Privacy (token/cache)** | ⚠️ Sridhar raised concerns — TBD | ✅ Local cache managed by SDK | ✅ Server-side, no local token concern |
+| **SISU team ownership** | ❌ External (Elie's team) | ✅ Fully owned | ❌ External (UCS team) |
 
 ---
 
@@ -583,16 +624,19 @@ graph TD
 |---|----------|-------|----------|--------|
 | 1 | Can Roaming Client push data to external services (ECS, Pacman)? | Sahil / Shreeya / Madhu | 🔴 High | ❓ Under investigation |
 | 2 | Win32 Roaming POC — can state be read at Win32 boot? | Shreeya + Abhishek Malviya | 🔴 High | ⏳ POC in progress |
-| 3 | Android Roaming POC — results and timeline? | T Madhu Kumar | 🔴 High | ⏳ POC in progress |
-| 4 | OLS licensing check details for Native/Mobile boot | Chaitanya Gogineni | 🟠 Medium | ⏳ Section 4 placeholder |
-| 5 | Cold-start behavior — which approach has best UX on new device? | Madhu Kumar | 🟠 Medium | ❓ Open |
-| 6 | Tenant admin control — gaps in current commercial flow? | Gabrielle / Sangeetha | 🟠 Medium | ⏳ PM sync scheduled |
-| 7 | UCS API — MSA+AAD support? Onboarding timeline? | Amit Jain / UCS team | 🟠 Medium | ❓ Not started |
-| 8 | Alberto's team on API contracts — schedule alignment? | Madhu Kumar | 🟠 Medium | ⏳ Scheduled |
-| 9 | Cost estimates (SWAG) for Roaming Client at Frontier scale | Sangeetha Muthurajan | 🟡 Low | ❓ In progress |
-| 10 | Should ECS + FPS be deprecated once Roaming stable on WAC? | Elie Aoun / Sridhar | 🟡 Low | ❓ Open |
-| 11 | Pacman integration for consent sharing — timeline and API? | TBD | 🟡 Low (future) | ❓ Not started |
-| 12 | iOS Roaming Client POC — who picks it up? | Sridhar / Shreeya | 🟡 Low | ❓ Not assigned |
+| 3 | Android Roaming — JNI contract design and 2–4 week implementation plan | T Madhu Kumar | 🔴 High | ⏳ POC in progress |
+| 4 | **Privacy concern (Sridhar): token handling and local device caching with ECS** — clarify and document | Shreeya / Sridhar | 🔴 High | ⏳ Weekend discussion planned |
+| 5 | OLS licensing check details for Native/Mobile boot — how wired in? | Chaitanya Gogineni | 🟠 Medium | ⏳ Section 5 placeholder |
+| 6 | Cold-start behavior — which approach has best UX on new device? | Madhu Kumar | 🟠 Medium | ❓ Open |
+| 7 | Tenant admin control — gaps for Roaming and UCS? Currently absent from both. | Gabrielle / Sangeetha | 🟠 Medium | ⏳ PM sync scheduled |
+| 8 | 30-day cache cool-off period — confirm decision and apply to which platforms/systems? | Sridhar / PMs | 🟠 Medium | ⏳ In discussion |
+| 9 | UCS API — MSA+AAD support? Onboarding timeline? | Amit Jain / UCS team | 🟠 Medium | ❓ Not started |
+| 10 | Commercial scale concern — can current Roaming/ECS approach scale from limited users to full commercial rollout? | Sangeetha Muthurajan | 🟠 Medium | ❓ In progress |
+| 11 | Alberto's team on API contracts — schedule alignment? | Madhu Kumar | 🟠 Medium | ⏳ Scheduled |
+| 12 | Operational cost: per-day running cost for ECS+FPS vs Roaming vs UCS at scale | Sangeetha / Sridhar | 🟡 Low | ❓ SWAG in progress |
+| 13 | Should ECS + FPS be deprecated on WAC once Roaming is stable? | Elie Aoun / Sridhar | 🟡 Low | ❓ Open |
+| 14 | Pacman integration for consent sharing — API and timeline? | TBD | 🟡 Low (future) | ❓ Not started |
+| 15 | iOS Roaming Client POC — who picks it up? | Sridhar / Shreeya | 🟡 Low | ❓ Not assigned |
 
 ---
 
@@ -623,7 +667,8 @@ graph TD
 ## 13. References
 
 - **Sridhar Dantuluri → Abhishek Bag 1:1 chat** — May 11, 2026 (5-section framework, Teams)
-- **SSC Sync Internal meeting recording** — May 8, 2026 (madhukumart SharePoint recording)
+- **SSC Sync Internal meeting recording + transcript** — May 8, 2026 (madhukumart SharePoint; transcript: Abhishek Bag, T Madhu Kumar, Shreeya Singh, Abhishek Malviya)
+- **SSC Sync Internal meeting notes** — May 8, 2026 (key decisions: Roaming for enrollment, UCS consideration for consent; Cosmos DB as SoT; Android JNI; ~30-day cool-off)
 - **Follow up on Frontier consent requirements** (Teams meeting chat) — Apr 30 – May 8, 2026
 - **SSC-Sync Internal chat** — Apr–May 2026 (Teams — Sridhar, Shreeya, Madhu, Sahil et al.)
 - **Approach Comparison.loop** — Shreeya Singh (May 5, 2026) _(initial high-level comparison)_
@@ -641,3 +686,4 @@ graph TD
 
 _Draft v2.0 — Section 4 (Commercial Flow) pending Chaitanya Gogineni's input._
 _Please review, validate open questions, and add corrections before sharing with the wider group._
+
